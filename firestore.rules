@@ -1,0 +1,261 @@
+rules_version = '2';
+
+/**
+ * Ice Age Creamery — Firestore security rules.
+ *
+ * Model
+ *   • Default deny. Nothing is readable or writable unless a rule below allows it.
+ *   • A customer may only ever touch their own profile and their own orders.
+ *   • Staff are identified by the server, never by the browser: either a custom
+ *     claim (staff/admin/role) or a document at staff/{uid} with active != false.
+ *     Both can only be set from the Firebase console or a trusted server.
+ *   • Loyalty points and tier are not writable by customers. Grant them from the
+ *     console or a server process, so points cannot be minted from devtools.
+ *
+ * Deploy:  firebase deploy --only firestore:rules
+ */
+service cloud.firestore {
+  match /databases/{database}/documents {
+
+    // ── Helpers ───────────────────────────────────────────────────
+    function isSignedIn() {
+      return request.auth != null;
+    }
+
+    function isUser(uid) {
+      return isSignedIn() && request.auth.uid == uid;
+    }
+
+    function claims() {
+      return request.auth.token;
+    }
+
+    function authEmail() {
+      return claims().get('email', '').lower();
+    }
+
+    // ── Owner ─────────────────────────────────────────────────────
+    // EDIT THIS before deploying: the one address allowed to claim the owner
+    // account from the staff portal's first-run screen. It must match
+    // VITE_ADMIN_OWNER_EMAIL in the site's environment. Everyone else is added
+    // by an admin from inside the portal (Admin → Team).
+    function ownerEmail() {
+      return 'gummadivya123@gmail.com';
+    }
+
+    function isOwnerEmail() {
+      return isSignedIn()
+        && claims().get('email_verified', false) == true
+        && authEmail() == ownerEmail();
+    }
+
+    function validStaffRecord() {
+      return request.resource.data.keys().hasOnly([
+               'name', 'email', 'role', 'active', 'createdAt', 'updatedAt'
+             ])
+        && request.resource.data.name is string
+        && request.resource.data.name.size() > 0
+        && request.resource.data.name.size() <= 80
+        && request.resource.data.email is string
+        && request.resource.data.role in ['admin', 'manager', 'staff']
+        && request.resource.data.active is bool;
+    }
+
+    function hasStaffClaim() {
+      return isSignedIn() && (
+        claims().get('staff', false) == true ||
+        claims().get('admin', false) == true ||
+        claims().get('role', '') in ['admin', 'manager', 'staff']
+      );
+    }
+
+    function staffDoc() {
+      return get(/databases/$(database)/documents/staff/$(request.auth.uid));
+    }
+
+    function hasStaffRecord() {
+      return isSignedIn()
+        && exists(/databases/$(database)/documents/staff/$(request.auth.uid))
+        && staffDoc().data.get('active', true) == true;
+    }
+
+    function isStaff() {
+      return !isStaffDisabled() && (hasStaffClaim() || hasStaffRecord());
+    }
+
+    // Deactivation in Team overrides an older custom claim as well.
+    function isStaffDisabled() {
+      return isSignedIn()
+        && exists(/databases/$(database)/documents/staff/$(request.auth.uid))
+        && staffDoc().data.get('active', true) == false;
+    }
+
+    function isAdmin() {
+      return isSignedIn() && !isStaffDisabled() && (
+        claims().get('admin', false) == true ||
+        claims().get('role', '') == 'admin' ||
+        (hasStaffRecord() && staffDoc().data.get('role', 'staff') == 'admin')
+      );
+    }
+
+    // ── Staff directory ───────────────────────────────────────────
+    // A staff member may read their own record (that is how the portal
+    // authorises them). Only an admin may list the team or add to it.
+    match /staff/{uid} {
+      allow get: if isUser(uid) || isAdmin();
+      allow list: if isAdmin();
+
+      // An admin adds staff from Admin → Team …
+      allow create: if (isAdmin() && validStaffRecord())
+        // … and, exactly once, the configured owner claims their own admin
+        // record from the portal's first-run screen. This is self-granting, so
+        // it requires a verified email and one shape: their own document,
+        // admin, active. Nobody else can create a staff record for themselves.
+        || (isUser(uid)
+            && isOwnerEmail()
+            && request.resource.data.email == authEmail()
+            && request.resource.data.role == 'admin'
+            && request.resource.data.active == true
+            && validStaffRecord());
+
+      // Admins change roles and switch access off. An admin cannot strip their
+      // own admin rights or disable themselves — that would lock the store out.
+      allow update: if isAdmin()
+        && validStaffRecord()
+        && (uid != request.auth.uid
+            || (request.resource.data.role == 'admin'
+                && request.resource.data.active == true));
+
+      // Access is removed by setting active:false, which keeps the audit trail.
+      allow delete: if false;
+    }
+
+    // ── Customer profiles ─────────────────────────────────────────
+    match /customers/{uid} {
+
+      // A customer reads only their own profile. Staff can look customers up
+      // (counter orders, loyalty) but customers can never read each other.
+      allow get: if isUser(uid) || isStaff();
+      allow list: if isStaff();
+
+      // Self-registration: the document must be the caller's own, carry no
+      // password field, and start at the fixed welcome bonus on the base tier.
+      allow create: if isUser(uid)
+        && request.resource.data.keys().hasOnly([
+             'name', 'email', 'phone', 'favoriteFlavor', 'memberSince',
+             'points', 'tier', 'authProvider', 'createdAt', 'updatedAt'
+           ])
+        && request.resource.data.name is string
+        && request.resource.data.name.size() > 0
+        && request.resource.data.name.size() <= 80
+        && request.resource.data.email is string
+        && request.resource.data.email == authEmail()
+        && request.resource.data.phone is string
+        && request.resource.data.phone.size() <= 24
+        && request.resource.data.points == 100
+        && request.resource.data.tier == 'Classic';
+
+      // Self-service edits: contact details only. Points, tier and email are
+      // immutable here, so loyalty balances cannot be edited by the customer.
+      allow update: if isUser(uid)
+        && request.resource.data.diff(resource.data).affectedKeys()
+             .hasOnly(['name', 'phone', 'favoriteFlavor', 'updatedAt'])
+        && request.resource.data.name is string
+        && request.resource.data.name.size() > 0
+        && request.resource.data.name.size() <= 80
+        && request.resource.data.phone is string
+        && request.resource.data.phone.size() <= 24;
+
+      // Staff may adjust loyalty and contact details, but never the account's
+      // email (that belongs to Firebase Auth) and never add a password field.
+      allow update: if isStaff()
+        && request.resource.data.diff(resource.data).affectedKeys()
+             .hasOnly(['name', 'phone', 'favoriteFlavor', 'points', 'tier', 'updatedAt'])
+        && request.resource.data.points is int
+        && request.resource.data.points >= 0
+        && request.resource.data.tier in ['Classic', 'Gold Scoop', 'Platinum Swirl'];
+
+      // Deleting a customer is an owner action, done from the console.
+      allow delete: if false;
+    }
+
+    // ── Orders ────────────────────────────────────────────────────
+    match /orders/{orderId} {
+
+      // A customer may read an order that is linked to their account. Staff
+      // read the whole order book. Queries must be scoped accordingly: a
+      // customer query has to filter on customerId == their own uid.
+      allow get: if isStaff()
+        || (isSignedIn() && resource.data.customerId == request.auth.uid);
+
+      // A customer's query must be constrained to their own uid. Firestore
+      // rejects any wider query because it cannot prove this condition for
+      // every document the query could return.
+      allow list: if isStaff()
+        || (isSignedIn() && resource.data.customerId == request.auth.uid);
+
+      // Staff create counter orders and progress every order.
+      allow create: if isStaff()
+        && request.resource.data.total is number
+        && request.resource.data.total >= 0
+        && request.resource.data.items is list
+        && request.resource.data.items.size() > 0
+        && request.resource.data.status in
+             ['awaiting_confirmation', 'pending', 'preparing', 'ready', 'completed', 'cancelled'];
+
+      // A customer may place their OWN website order, and only in the shape
+      // below: it must be theirs, unpaid or awaiting the gateway, and start as
+      // 'awaiting_confirmation' so the store accepts it before anything is
+      // made. Rules cannot add up a list, so the money is not trusted here —
+      // staff re-price every line against the live menu on confirmation
+      // (see verifyOrderPricing), and nothing is charged before that.
+      allow create: if isSignedIn()
+        && request.resource.data.keys().hasOnly([
+             'customerName', 'phone', 'items', 'subtotal', 'deliveryFee', 'total',
+             'status', 'paymentMethod', 'paymentStatus', 'channel', 'fulfilment',
+             'createdAt', 'notes', 'customerId', 'customerEmail', 'createdBy', 'updatedAt'
+           ])
+        && request.resource.data.customerId == request.auth.uid
+        && request.resource.data.createdBy == request.auth.uid
+        && request.resource.data.channel == 'online'
+        && request.resource.data.status == 'awaiting_confirmation'
+        && request.resource.data.paymentStatus in ['unpaid', 'pending']
+        && request.resource.data.paymentMethod in ['cash', 'upi', 'card', 'online']
+        && request.resource.data.items is list
+        && request.resource.data.items.size() > 0
+        && request.resource.data.items.size() <= 50
+        && request.resource.data.total is number
+        && request.resource.data.total >= 0
+        && request.resource.data.total <= 100000
+        && request.resource.data.subtotal is number
+        && request.resource.data.subtotal >= 0
+        && request.resource.data.deliveryFee is number
+        && request.resource.data.deliveryFee >= 0
+        && request.resource.data.total ==
+             request.resource.data.subtotal + request.resource.data.deliveryFee
+        && request.resource.data.fulfilment.type in ['pickup', 'delivery'];
+
+      // Only staff move an order along, mark it paid, or change its contents.
+      // A customer cannot edit an order after placing it — they phone the store.
+      allow update: if isStaff()
+        && request.resource.data.status in
+             ['awaiting_confirmation', 'pending', 'preparing', 'ready', 'completed', 'cancelled'];
+
+      allow delete: if isAdmin();
+    }
+
+    // ── Store settings (opening hours, banner, promos) ────────────
+    match /store_settings/{settingId} {
+      allow read: if true;          // the public site renders these
+      allow write: if isStaff();
+    }
+
+    // ── Menu catalog ──────────────────────────────────────────────
+    match /menu_items/{itemId} {
+      allow read: if true;
+      allow write: if isStaff();
+    }
+
+    // Anything not matched above stays denied.
+  }
+}
